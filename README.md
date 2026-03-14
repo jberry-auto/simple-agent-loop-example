@@ -11,7 +11,6 @@ User task
     |
     v
 while True:
-    deduplicate context
     compact if over token limit
     load memory into system prompt
     call Claude API (with thinking + tools)

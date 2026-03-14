@@ -95,72 +95,47 @@ TOOLS: list[dict[str, Any]] = [
     },
 ]
 
-
-# --- Tool Execution ---
-
 def execute_tool(name: str, args: dict[str, Any]) -> str:
     """Dispatch and execute a single tool call."""
     match name:
         case "read_file":
-            return _read_file(args["path"])
+            try:
+                return Path(args["path"]).read_text()
+            except (FileNotFoundError, IsADirectoryError) as exc:
+                return f"Error: {exc}"
         case "search_files":
-            return _search_files(args["pattern"], args.get("path", "."), args.get("glob", "*"))
+            try:
+                result = subprocess.run(
+                    ["grep", "-rn", "--include", args.get("glob", "*"),
+                     args["pattern"], args.get("path", ".")],
+                    capture_output=True, text=True, timeout=10,
+                )
+                return result.stdout[:10_000] if result.stdout else "No matches found."
+            except subprocess.TimeoutExpired:
+                return "Error: search timed out."
         case "write_file":
-            return _write_file(args["path"], args["content"])
+            fp = Path(args["path"])
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_text(args["content"])
+            return f"Wrote {len(args['content'])} bytes to {args['path']}"
         case "plan":
             return f"Plan recorded:\n{args['plan']}"
         case "memory_save":
-            return _memory_save(args["key"], args["value"])
+            MEMORY_DIR.mkdir(exist_ok=True)
+            (MEMORY_DIR / f"{args['key']}.md").write_text(args["value"])
+            return f"Saved memory: {args['key']}"
         case "memory_load":
-            return _memory_load(args["key"])
+            key = args["key"]
+            if key == "_index":
+                if not MEMORY_DIR.exists():
+                    return "No memories saved yet."
+                keys = [f.stem for f in MEMORY_DIR.glob("*.md")]
+                return f"Stored keys: {', '.join(keys)}" if keys else "No memories saved yet."
+            path = MEMORY_DIR / f"{key}.md"
+            return path.read_text() if path.exists() else f"No memory for key: {key}"
         case _:
             return f"Error: unknown tool '{name}'"
 
-
-def _read_file(path: str) -> str:
-    try:
-        return Path(path).read_text()
-    except (FileNotFoundError, IsADirectoryError) as exc:
-        return f"Error: {exc}"
-
-
-def _search_files(pattern: str, path: str, glob: str) -> str:
-    try:
-        result = subprocess.run(
-            ["grep", "-rn", "--include", glob, pattern, path],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        return result.stdout[:10_000] if result.stdout else "No matches found."
-    except subprocess.TimeoutExpired:
-        return "Error: search timed out."
-
-
-def _write_file(path: str, content: str) -> str:
-    file_path = Path(path)
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text(content)
-    return f"Wrote {len(content)} bytes to {path}"
-
-
-def _memory_save(key: str, value: str) -> str:
-    MEMORY_DIR.mkdir(exist_ok=True)
-    (MEMORY_DIR / f"{key}.md").write_text(value)
-    return f"Saved memory: {key}"
-
-
-def _memory_load(key: str) -> str:
-    if key == "_index":
-        if not MEMORY_DIR.exists():
-            return "No memories saved yet."
-        keys = [f.stem for f in MEMORY_DIR.glob("*.md")]
-        return f"Stored keys: {', '.join(keys)}" if keys else "No memories saved yet."
-    path = MEMORY_DIR / f"{key}.md"
-    return path.read_text() if path.exists() else f"No memory for key: {key}"
-
-
-# --- Context Management ---
 
 def load_memory_context() -> str:
     """Load all memory files into a context string."""
@@ -178,52 +153,20 @@ def estimate_tokens(messages: list[dict[str, Any]]) -> int:
     return len(json.dumps(messages, default=str)) // 4
 
 
-def deduplicate_tool_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Remove duplicate tool results (same tool_use_id seen twice)."""
-    seen_ids: set[str] = set()
-    deduped: list[dict[str, Any]] = []
-    for msg in messages:
-        if msg["role"] == "user" and isinstance(msg.get("content"), list):
-            unique_blocks = []
-            for block in msg["content"]:
-                if block.get("type") == "tool_result":
-                    tid = block.get("tool_use_id", "")
-                    if tid not in seen_ids:
-                        seen_ids.add(tid)
-                        unique_blocks.append(block)
-                else:
-                    unique_blocks.append(block)
-            if unique_blocks:
-                deduped.append({**msg, "content": unique_blocks})
-        else:
-            deduped.append(msg)
-    return deduped
-
-
-def _strip_thinking_for_summary(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Strip thinking blocks from messages so they can be sent to a fresh API call."""
-    stripped = []
-    for msg in messages:
-        if msg["role"] == "assistant" and isinstance(msg.get("content"), list):
-            filtered = [
-                b for b in msg["content"]
-                if not (isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking"))
-            ]
-            if filtered:
-                stripped.append({**msg, "content": filtered})
-        else:
-            stripped.append(msg)
-    return stripped
-
-
 def compact_context(
     client: anthropic.Anthropic,
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Summarize conversation via Claude to reduce context size."""
     logger.info("Compacting context (%d est. tokens)...", estimate_tokens(messages))
-    # Thinking blocks have signatures bound to the original conversation — strip them
-    stripped = _strip_thinking_for_summary(messages)
+    stripped = [
+        {**m, "content": [b for b in m["content"]
+         if not (isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking"))]}
+        if m["role"] == "assistant" and isinstance(m.get("content"), list)
+        else m
+        for m in messages
+    ]
+    stripped = [m for m in stripped if m.get("content")]
     resp = client.messages.create(
         model=MODEL,
         max_tokens=4096,
@@ -238,21 +181,8 @@ def compact_context(
     return [{"role": "user", "content": f"[Conversation compacted]\n\n{summary}"}]
 
 
-# --- Main Loop ---
-
-def run_agent(
-    user_task: str,
-    system_prompt: str = "",
-) -> str:
-    """Run the agent loop until the model stops calling tools.
-
-    Args:
-        user_task: The user's task description.
-        system_prompt: Optional system prompt override.
-
-    Returns:
-        The final text response from the model.
-    """
+def run_agent(user_task: str, system_prompt: str = "") -> str:
+    """Run the agent loop until the model stops calling tools."""
     client = anthropic.Anthropic()
 
     default_system = (
@@ -264,8 +194,6 @@ def run_agent(
     messages: list[dict[str, Any]] = [{"role": "user", "content": user_task}]
 
     while True:
-        messages = deduplicate_tool_results(messages)
-
         # Compact if approaching context limit
         if estimate_tokens(messages) > MAX_CONTEXT_TOKENS:
             messages = compact_context(client, messages)
@@ -289,26 +217,19 @@ def run_agent(
             extra_headers={"anthropic-beta": INTERLEAVED_THINKING_BETA},
         )
 
-        # Preserve the full response content (thinking + text + tool_use) unmodified.
-        # The SDK returns content blocks as objects; pass them directly so thinking
-        # block signatures stay intact for the next turn.
+        # Preserve full content (including thinking blocks) for signature integrity
         messages.append({"role": "assistant", "content": response.content})
 
-        # Log thinking for observability
         for block in response.content:
             if getattr(block, "type", None) == "thinking":
                 logger.info("Thinking: %s", block.thinking[:200])
 
-        # Collect tool calls
         tool_calls = [b for b in response.content if getattr(b, "type", None) == "tool_use"]
-
-        # Exit condition: no tool calls means the agent is done
         if not tool_calls:
             return "\n".join(
                 b.text for b in response.content if getattr(b, "type", None) == "text"
             )
 
-        # Execute tools and feed results back
         tool_results = []
         for tc in tool_calls:
             logger.info("Executing: %s", tc.name)
