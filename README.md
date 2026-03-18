@@ -11,8 +11,9 @@ User task
     |
     v
 while True:
-    compact if over token limit
     load memory into system prompt
+    estimate full context (messages + system + tools)
+    compact while over token limit
     call Claude API (with thinking + tools)
     append response (thinking blocks preserved unmodified)
     if no tool_use blocks -> return final text
@@ -57,7 +58,7 @@ python agent.py 'find all TODO comments and create a summary'
 
 - **No human-in-the-loop confirmation.** Destructive actions (file writes, overwrites) execute immediately without user approval. A production harness should gate dangerous operations behind confirmation prompts.
 
-- **Naive token estimation.** Context size is estimated at ~4 characters per token. This is a rough heuristic — actual token counts vary. The compaction threshold may trigger too early or too late.
+- **Naive token estimation.** Context size is estimated at ~4 characters per token. This is a rough heuristic — actual token counts vary. The compaction threshold may trigger too early or too late. The estimate does account for system prompt, tools, and memory overhead.
 
 - **No rate limiting or retry logic.** API errors, rate limits, and transient failures are not handled. The loop will crash on the first API error.
 

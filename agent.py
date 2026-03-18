@@ -194,18 +194,23 @@ def run_agent(user_task: str, system_prompt: str = "") -> str:
     messages: list[dict[str, Any]] = [{"role": "user", "content": user_task}]
 
     while True:
-        # Compact if approaching context limit
-        if estimate_tokens(messages) > MAX_CONTEXT_TOKENS:
-            messages = compact_context(client, messages)
-            messages.append({"role": "user", "content": f"Continue working on: {user_task}"})
-
         # Refresh memory into system prompt
         active_system = system
         memory = load_memory_context()
         if memory:
             active_system += f"\n\n## Persistent Memory\n{memory}"
 
-        logger.info("Calling model (%d est. tokens)...", estimate_tokens(messages))
+        # Estimate overhead from system prompt, tools, and memory
+        overhead = estimate_tokens(
+            [{"system": active_system}, {"tools": TOOLS}]
+        )
+
+        # Compact before every LLM call if total context exceeds limit
+        while estimate_tokens(messages) + overhead > MAX_CONTEXT_TOKENS:
+            messages = compact_context(client, messages)
+            messages.append({"role": "user", "content": f"Continue working on: {user_task}"})
+
+        logger.info("Calling model (%d est. tokens)...", estimate_tokens(messages) + overhead)
 
         response = client.messages.create(
             model=MODEL,
